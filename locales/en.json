@@ -1,0 +1,43 @@
+{
+  "site": {
+    "title": "Olymposuite",
+    "tagline": "Docs"
+  },
+  "nav": {
+    "home": "Overview",
+    "userGuide": "User Guide",
+    "developerGuide": "Developer Guide",
+    "onThisPage": "On this page",
+    "menu": "Open navigation menu",
+    "close": "Close navigation menu",
+    "documentation": "Documentation"
+  },
+  "search": {
+    "button": "Search",
+    "placeholder": "Search documentation…",
+    "dialogLabel": "Search documentation",
+    "close": "Close search",
+    "loading": "Loading search…",
+    "unavailable": "Search is available after a production build. Run `pnpm build`, then serve the `out/` directory.",
+    "shortcutHint": "Ctrl+K"
+  },
+  "theme": {
+    "toggle": "Toggle color theme"
+  },
+  "language": {
+    "label": "Language"
+  },
+  "pager": {
+    "previous": "Previous",
+    "next": "Next"
+  },
+  "fallback": {
+    "title": "Olymposuite Documentation",
+    "intro": "Olymposuite is a suite of self-hosted media automation apps: Zephyrus (torrent download-phase policy), Eros (adult scene collection manager), Psyche (metadata-first TV and movie library automation), and Morpheus (media-archive compression). Pick an app below to get started."
+  },
+  "notFound": {
+    "title": "Page not found",
+    "body": "The page you are looking for does not exist or has moved.",
+    "back": "Back to the documentation"
+  }
+}
