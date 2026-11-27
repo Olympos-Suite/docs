@@ -2,10 +2,13 @@
 #
 # Olymposuite installer — interactive Docker Compose generator
 #
-# Asks which suite apps (and optional companion services) you want, where
-# your disks/media live, then generates a ready-to-run docker-compose.yml,
-# .env and NEXT_STEPS.md in one directory. A single `docker compose up -d`
-# brings the whole selection up.
+# Asks which suite apps (and optional companion services) you want and one
+# base data directory, then generates a ready-to-run docker-compose.yml,
+# .env and NEXT_STEPS.md in one directory. App data is wired as subpaths
+# under the data root (downloads/, media/adult/, media/series/, ...), extra
+# directories can be added freely and are auto-created, and a single
+# `docker compose up -d` brings the whole selection up.
+# `docker compose down && rm -rf <install dir>` removes it completely.
 #
 # Usage:
 #   curl -fsSL <docs-site>/install.sh | bash
@@ -108,18 +111,6 @@ ask() {
   printf '%s\n' "${reply:-$default}"
 }
 
-# ask_secret QUESTION -> prints the answer on stdout (hidden input, may be empty)
-ask_secret() {
-  local question="$1" reply
-  printf '%s (input hidden, Enter to skip): ' "$question" >&2
-  if ! IFS= read -rs -u "$READ_FD" reply; then
-    printf '\n' >&2
-    die "Input stream closed - aborting."
-  fi
-  printf '\n' >&2
-  printf '%s\n' "$reply"
-}
-
 # ask_yn QUESTION [y|n] -> return 0 = yes, 1 = no
 ask_yn() {
   local question="$1" default="${2:-y}" reply
@@ -204,6 +195,15 @@ random_secret() {
   fi
 }
 
+# random_password -> 6 chars from an unambiguous alphanumeric set
+random_password() {
+  local charset='ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789' pw="" i
+  for i in 1 2 3 4 5 6; do
+    pw="$pw${charset:$((RANDOM % ${#charset})):1}"
+  done
+  printf '%s\n' "$pw"
+}
+
 port_in_use() {
   local port="$1"
   # subshell only: never touch the parent's tty fd
@@ -261,6 +261,7 @@ ask_path() {
   local question="$1" default="$2" p
   while true; do
     p=$(ask "$question" "$default")
+    [ -n "$p" ] || return 0
     p=$(abs_path "$p")
     case "$p" in
       *'"'*|*$'\n'*|*$'\t'*)
@@ -463,57 +464,76 @@ PORT_QBITTORRENT=""; PORT_PROWLARR=""; PORT_JELLYFIN=""
 [ "$COMP_JELLYFIN" = "1" ]    && PORT_JELLYFIN=$(ask_port "Jellyfin web port" 8096)
 
 # ---------------------------------------------------------------------------
-# Step 6: disks & data paths
+# Step 6: data directory
 # ---------------------------------------------------------------------------
-step "6/8 - Disks & data paths (bind mounts on the host)"
-NEED_DOWNLOADS=$((APP_EROS + APP_PSYCHE + COMP_QBITTORRENT))
-NEED_TV_MOVIES=$((APP_PSYCHE + COMP_JELLYFIN))
+step "6/8 - Data directory"
+DATA_ROOT=$(ask_path "Base data directory (all app data lives under it)" "$INSTALL_DIR/data")
 
-SHARED_DOWNLOADS=""; SHARED_TV=""; SHARED_MOVIES=""; SHARED_ADULT=""
-if [ "$NEED_DOWNLOADS" -gt 0 ]; then
-  printf 'One downloads directory is shared by qBittorrent, Eros and Psyche.\n' >&2
-  SHARED_DOWNLOADS=$(ask_path "Downloads path (torrent client's download dir)" "$INSTALL_DIR/data/downloads")
-fi
-if [ "$NEED_TV_MOVIES" -gt 0 ]; then
-  SHARED_TV=$(ask_path "TV library path" "$INSTALL_DIR/data/media/tv")
-  SHARED_MOVIES=$(ask_path "Movies library path" "$INSTALL_DIR/data/media/movies")
-fi
-if [ "$APP_EROS" = "1" ]; then
-  SHARED_ADULT=$(ask_path "Adult media path (Eros organized output)" "$INSTALL_DIR/data/media/adult")
-fi
+# Subpaths are derived from the selected apps - there are no per-app
+# full-path questions; everything is created automatically under DATA_ROOT.
+SUB_DOWNLOADS=0; SUB_ADULT=0; SUB_SERIES=0; SUB_MOVIES=0
+NEED_MEDIA=$((APP_PSYCHE + COMP_JELLYFIN))
+[ $((APP_EROS + APP_PSYCHE + COMP_QBITTORRENT)) -gt 0 ] && SUB_DOWNLOADS=1
+[ "$APP_EROS" = "1" ] && SUB_ADULT=1
+[ "$NEED_MEDIA" -gt 0 ] && SUB_SERIES=1
+[ "$NEED_MEDIA" -gt 0 ] && SUB_MOVIES=1
 
-MORPHEUS_ARCHIVE_HOSTS=""
-if [ "$APP_MORPHEUS" = "1" ]; then
-  printf 'Morpheus transcodes archive roots in place. Point it at the disks that hold your archive.\n' >&2
-  MORPHEUS_ARCHIVE_HOSTS=$(ask_path "First archive root" "$INSTALL_DIR/data/archive")
-  while ask_yn "Add another archive root?" "n"; do
-    MORPHEUS_ARCHIVE_HOSTS="$MORPHEUS_ARCHIVE_HOSTS
-$(ask_path "Archive root path" "")"
-  done
+printf 'The installer will create and wire these subpaths under %s:\n' "$DATA_ROOT" >&2
+[ "$SUB_DOWNLOADS" = "1" ] && printf '    downloads/      torrent downloads (qBittorrent, Eros, Psyche)\n' >&2
+[ "$SUB_ADULT" = "1" ]     && printf '    media/adult/    Eros organized output\n' >&2
+[ "$SUB_SERIES" = "1" ]    && printf '    media/series/   TV library (Psyche, Jellyfin)\n' >&2
+[ "$SUB_MOVIES" = "1" ]    && printf '    media/movies/   movie library (Psyche, Jellyfin)\n' >&2
+if [ "$APP_MORPHEUS" = "1" ] && [ $((SUB_ADULT + SUB_SERIES + SUB_MOVIES)) -gt 0 ]; then
+  printf '    (media/ is mounted into Morpheus as archive root /data/archive)\n' >&2
 fi
 
 JELLYFIN_ADULT=0
-if [ "$COMP_JELLYFIN" = "1" ] && [ "$APP_EROS" = "1" ]; then
-  if ask_yn "Also mount the adult media path into Jellyfin?" "n"; then
+if [ "$COMP_JELLYFIN" = "1" ] && [ "$SUB_ADULT" = "1" ]; then
+  if ask_yn "Also mount media/adult into Jellyfin?" "n"; then
     JELLYFIN_ADULT=1
   fi
 fi
 
-# Finalize the archive root list (trim blank lines) and derive unique
-# container-side mount names: host<TAB>slug pairs in MORPHEUS_MOUNTS.
+# Extra custom directories: any number, auto-created, mounted into Morpheus
+# as additional archive roots (e.g. disks that already hold media).
+EXTRA_DIRS=""
+if [ "$APP_MORPHEUS" = "1" ]; then
+  _default="n"
+  if [ $((SUB_ADULT + SUB_SERIES + SUB_MOVIES)) -eq 0 ]; then
+    _default="y"
+    printf 'Morpheus needs at least one archive root.\n' >&2
+  fi
+  if ask_yn "Add extra directories as Morpheus archive roots?" "$_default"; then
+    printf 'Enter one path per line; Enter on an empty line finishes.\n' >&2
+    while true; do
+      _d=$(ask_path "Extra directory path (Enter to finish)" "")
+      [ -n "$_d" ] || break
+      EXTRA_DIRS="$EXTRA_DIRS
+$_d"
+    done
+    EXTRA_DIRS=$(printf '%s\n' "$EXTRA_DIRS" | sed '/^[[:space:]]*$/d')
+  fi
+fi
+
+# Morpheus mounts: the whole media tree as /data/archive (when any media
+# subpath exists) plus one /data/<slug> mount per extra directory.
+# MORPHEUS_MOUNTS holds host<TAB>container lines.
 MORPHEUS_MOUNTS=""
-if [ "$APP_MORPHEUS" = "1" ] && [ -n "$MORPHEUS_ARCHIVE_HOSTS" ]; then
-  MORPHEUS_ARCHIVE_HOSTS=$(printf '%s\n' "$MORPHEUS_ARCHIVE_HOSTS" | sed '/^[[:space:]]*$/d')
-  _seen=""
+if [ "$APP_MORPHEUS" = "1" ]; then
+  if [ $((SUB_ADULT + SUB_SERIES + SUB_MOVIES)) -gt 0 ]; then
+    MORPHEUS_MOUNTS="$DATA_ROOT/media	/data/archive
+"
+  fi
+  _seen="archive"
   while IFS= read -r _root; do
     [ -n "$_root" ] || continue
     _slug=$(archive_slug "$_root" "$_seen")
     _seen="$_seen
 $_slug"
-    MORPHEUS_MOUNTS="$MORPHEUS_MOUNTS$_root	$_slug
+    MORPHEUS_MOUNTS="$MORPHEUS_MOUNTS$_root	/data/$_slug
 "
   done <<EOF
-$MORPHEUS_ARCHIVE_HOSTS
+$EXTRA_DIRS
 EOF
 fi
 
@@ -522,7 +542,21 @@ fi
 # ---------------------------------------------------------------------------
 step "7/8 - App settings"
 
-ZEPHYRUS_TOKEN=""; QBIT_PASSWORD=""; ZEPHYRUS_CLIENT_URL=""; ZEPHYRUS_CLIENT_USER=""
+# One generated qBittorrent WebUI password, wired into the apps via .env
+# (no password questions). qBittorrent 5.x forces you to set a WebUI
+# password on first login - set it to this generated one and everything
+# lines up (Zephyrus reads it via env:QBIT_PASSWORD).
+QBIT_PASSWORD=""
+if [ "$COMP_QBITTORRENT" = "1" ] || [ "$APP_ZEPHYRUS" = "1" ]; then
+  QBIT_PASSWORD=$(random_password) || die "Could not generate a password."
+  info "Generated qBittorrent WebUI password: $QBIT_PASSWORD"
+  if [ "$COMP_QBITTORRENT" = "0" ]; then
+    warn "You are connecting to an existing qBittorrent - if its WebUI password"
+    warn "differs, put the real one into .env (QBIT_PASSWORD) and re-run up -d."
+  fi
+fi
+
+ZEPHYRUS_TOKEN=""; ZEPHYRUS_CLIENT_URL=""; ZEPHYRUS_CLIENT_USER=""
 ZEPHYRUS_GROUPS=""; ZEPHYRUS_EXTRA_HOSTS=0
 if [ "$APP_ZEPHYRUS" = "1" ]; then
   printf 'Zephyrus manages ONE qBittorrent 5.x connection (Web API >= 2.11).\n' >&2
@@ -535,11 +569,6 @@ if [ "$APP_ZEPHYRUS" = "1" ]; then
     *host.docker.internal*) ZEPHYRUS_EXTRA_HOSTS=1 ;;
   esac
   ZEPHYRUS_CLIENT_USER=$(ask "qBittorrent WebUI username" "admin")
-  QBIT_PASSWORD=$(ask_secret "qBittorrent WebUI password (stored as QBIT_PASSWORD in .env)")
-  if [ -z "$QBIT_PASSWORD" ]; then
-    warn "Empty password - set QBIT_PASSWORD in .env once the client is configured,"
-    warn "then run: docker compose up -d zephyrus"
-  fi
   ZEPHYRUS_DEFAULT_GROUPS=""
   [ "$APP_EROS" = "1" ] && ZEPHYRUS_DEFAULT_GROUPS="eros"
   [ "$APP_PSYCHE" = "1" ] && ZEPHYRUS_DEFAULT_GROUPS="${ZEPHYRUS_DEFAULT_GROUPS:+$ZEPHYRUS_DEFAULT_GROUPS, }psyche"
@@ -589,14 +618,20 @@ SEP="---------------------------------------------------------------------"
   [ "$COMP_PROWLARR" = "1" ]    && printf ' prowlarr(:%s)' "${PORT_PROWLARR:-9696}"
   [ "$COMP_JELLYFIN" = "1" ]    && printf ' jellyfin(:%s)' "${PORT_JELLYFIN:-8096}"
   printf '\n'
-  [ -n "$SHARED_DOWNLOADS" ] && printf ' Downloads   : %s\n' "$SHARED_DOWNLOADS"
-  [ -n "$SHARED_TV" ]        && printf ' TV / movies : %s / %s\n' "$SHARED_TV" "$SHARED_MOVIES"
-  [ -n "$SHARED_ADULT" ]     && printf ' Adult media : %s\n' "$SHARED_ADULT"
-  if [ "$APP_MORPHEUS" = "1" ]; then
+  printf ' Data root   : %s\n' "$DATA_ROOT"
+  [ "$SUB_DOWNLOADS" = "1" ] && printf '   downloads/     (qBittorrent, Eros, Psyche)\n'
+  [ "$SUB_ADULT" = "1" ]     && printf '   media/adult/   (Eros)\n'
+  [ "$SUB_SERIES" = "1" ]    && printf '   media/series/  (Psyche, Jellyfin)\n'
+  [ "$SUB_MOVIES" = "1" ]    && printf '   media/movies/  (Psyche, Jellyfin)\n'
+  if [ "$APP_MORPHEUS" = "1" ] && [ -n "$MORPHEUS_MOUNTS" ]; then
     printf ' Archive     :'
-    printf '%s\n' "$MORPHEUS_ARCHIVE_HOSTS" | while IFS= read -r r; do printf ' %s' "$r"; done
+    printf '%s\n' "$MORPHEUS_MOUNTS" | while IFS=$'\t' read -r _h _c; do
+      [ -n "$_h" ] || continue
+      printf ' %s -> %s' "$_h" "$_c"
+    done
     printf '\n'
   fi
+  [ -n "$QBIT_PASSWORD" ] && printf ' qBit passwd : %s (in .env, used by the apps)\n' "$QBIT_PASSWORD"
   [ "$APP_ZEPHYRUS" = "1" ] && printf ' Zephyrus -> : %s (user: %s, groups: %s)\n' "$ZEPHYRUS_CLIENT_URL" "$ZEPHYRUS_CLIENT_USER" "$ZEPHYRUS_GROUPS"
   [ "$MORPHEUS_GPU" = "1" ] && printf ' GPU        : enabled for Morpheus\n'
   printf '%s\n' "$SEP"
@@ -605,7 +640,7 @@ SEP="---------------------------------------------------------------------"
 ask_yn "Generate the files?" "y" || die "Aborted - nothing was written."
 
 # ---------------------------------------------------------------------------
-# Create directories (ask before creating anything outside the install dir)
+# Create all data directories (auto-created; never deleted by the installer)
 # ---------------------------------------------------------------------------
 ALL_DIRS="$INSTALL_DIR/data"
 [ "$APP_ZEPHYRUS" = "1" ] && ALL_DIRS="$ALL_DIRS
@@ -628,32 +663,21 @@ $INSTALL_DIR/data/qbittorrent/config"
 $INSTALL_DIR/data/prowlarr/config"
 [ "$COMP_JELLYFIN" = "1" ] && ALL_DIRS="$ALL_DIRS
 $INSTALL_DIR/data/jellyfin/config"
-[ -n "$SHARED_DOWNLOADS" ] && ALL_DIRS="$ALL_DIRS
-$SHARED_DOWNLOADS"
-[ -n "$SHARED_TV" ] && ALL_DIRS="$ALL_DIRS
-$SHARED_TV"
-[ -n "$SHARED_MOVIES" ] && ALL_DIRS="$ALL_DIRS
-$SHARED_MOVIES"
-[ -n "$SHARED_ADULT" ] && ALL_DIRS="$ALL_DIRS
-$SHARED_ADULT"
-if [ -n "$MORPHEUS_ARCHIVE_HOSTS" ]; then
-  ALL_DIRS="$ALL_DIRS
-$MORPHEUS_ARCHIVE_HOSTS"
-fi
+[ "$SUB_DOWNLOADS" = "1" ] && ALL_DIRS="$ALL_DIRS
+$DATA_ROOT/downloads"
+[ "$SUB_ADULT" = "1" ] && ALL_DIRS="$ALL_DIRS
+$DATA_ROOT/media/adult"
+[ "$SUB_SERIES" = "1" ] && ALL_DIRS="$ALL_DIRS
+$DATA_ROOT/media/series"
+[ "$SUB_MOVIES" = "1" ] && ALL_DIRS="$ALL_DIRS
+$DATA_ROOT/media/movies"
+[ -n "$EXTRA_DIRS" ] && ALL_DIRS="$ALL_DIRS
+$EXTRA_DIRS"
 
 printf '%s\n' "$ALL_DIRS" | while IFS= read -r d; do
   [ -n "$d" ] || continue
   [ -d "$d" ] && continue
-  case "$d" in
-    "$INSTALL_DIR"|"$INSTALL_DIR"/*) ensure_dir "$d" ;;
-    *)
-      if ask_yn "Path '$d' does not exist. Create it?" "y"; then
-        ensure_dir "$d"
-      else
-        warn "Docker would create '$d' root-owned - fix ownership (chown $PUID:$PGID) before use."
-      fi
-      ;;
-  esac
+  ensure_dir "$d"
 done
 info "Directories ready."
 
@@ -686,11 +710,11 @@ PUID=$PUID
 PGID=$PGID
 TZ=$TZ
 ENVEOF
+[ -n "$QBIT_PASSWORD" ] && printf 'QBIT_PASSWORD=%s\n' "$QBIT_PASSWORD" >> "$ENV_FILE"
 
 [ "$APP_ZEPHYRUS" = "1" ] && cat >> "$ENV_FILE" <<ENVEOF
 PORT_ZEPHYRUS=$PORT_ZEPHYRUS
 ZEPHYRUS_TOKEN=$ZEPHYRUS_TOKEN
-QBIT_PASSWORD=$QBIT_PASSWORD
 ENVEOF
 [ "$APP_EROS" = "1" ] && cat >> "$ENV_FILE" <<ENVEOF
 PORT_EROS=$PORT_EROS
@@ -724,6 +748,7 @@ cat > "$COMPOSE_FILE" <<EOF
 # Stop:         docker compose down
 # Logs:         docker compose logs -f <service>
 # Update:       docker compose pull && docker compose up -d
+# Remove:       docker compose down && rm -rf <this directory>
 name: olymposuite
 
 services:
@@ -764,8 +789,8 @@ if [ "$APP_EROS" = "1" ]; then
   EB_CONFIG=$(compose_bind "$INSTALL_DIR/data/eros/config")
   EB_DB=$(compose_bind "$INSTALL_DIR/data/eros/db")
   EB_CE=$(compose_bind "$INSTALL_DIR/data/eros/cross-encoder")
-  EB_DL=$(compose_bind "$SHARED_DOWNLOADS")
-  EB_MEDIA=$(compose_bind "$SHARED_ADULT")
+  EB_DL=$(compose_bind "$DATA_ROOT/downloads")
+  EB_MEDIA=$(compose_bind "$DATA_ROOT/media/adult")
   EROS_DEPENDS=""
   if [ "$COMP_QBITTORRENT" = "1" ] || [ "$COMP_PROWLARR" = "1" ]; then
     EROS_DEPENDS="    depends_on:"
@@ -803,9 +828,9 @@ fi
 if [ "$APP_PSYCHE" = "1" ]; then
   PB_CONFIG=$(compose_bind "$INSTALL_DIR/data/psyche/config")
   PB_DATA=$(compose_bind "$INSTALL_DIR/data/psyche/data")
-  PB_TV=$(compose_bind "$SHARED_TV")
-  PB_MOVIES=$(compose_bind "$SHARED_MOVIES")
-  PB_DL=$(compose_bind "$SHARED_DOWNLOADS")
+  PB_TV=$(compose_bind "$DATA_ROOT/media/series")
+  PB_MOVIES=$(compose_bind "$DATA_ROOT/media/movies")
+  PB_DL=$(compose_bind "$DATA_ROOT/downloads")
   cat >> "$COMPOSE_FILE" <<EOF
   psyche:
     image: \${IMAGE_NAMESPACE:-olymposuite}/psyche:\${TAG:-latest}
@@ -820,7 +845,7 @@ if [ "$APP_PSYCHE" = "1" ]; then
     volumes:
       - "$PB_CONFIG:/config"          # DB + settings + session secret (back this up)
       - "$PB_DATA:/data"              # artwork + model caches (regenerable)
-      - "$PB_TV:/media/tv"            # TV library root
+      - "$PB_TV:/media/series"        # TV library root
       - "$PB_MOVIES:/media/movies"    # movie library root
       - "$PB_DL:/media/downloads"     # torrent client downloads
 
@@ -851,10 +876,10 @@ EOF
 EOF
   fi
   if [ -n "$MORPHEUS_MOUNTS" ]; then
-    printf '%s\n' "$MORPHEUS_MOUNTS" | while IFS=$'\t' read -r root slug; do
-      [ -n "$slug" ] || continue
+    printf '%s\n' "$MORPHEUS_MOUNTS" | while IFS=$'\t' read -r root container; do
+      [ -n "$container" ] || continue
       cat >> "$COMPOSE_FILE" <<EOF
-      - "$(compose_bind "$root"):/data/$slug"   # archive root (host: $root)
+      - "$(compose_bind "$root"):$container"   # archive root (host: $root)
 EOF
     done
   fi
@@ -876,7 +901,7 @@ fi
 
 if [ "$COMP_QBITTORRENT" = "1" ]; then
   QB_CONFIG=$(compose_bind "$INSTALL_DIR/data/qbittorrent/config")
-  QB_DL=$(compose_bind "$SHARED_DOWNLOADS")
+  QB_DL=$(compose_bind "$DATA_ROOT/downloads")
   cat >> "$COMPOSE_FILE" <<EOF
   qbittorrent:
     image: lscr.io/linuxserver/qbittorrent:$COMPANION_TAG
@@ -934,19 +959,19 @@ if [ "$COMP_JELLYFIN" = "1" ]; then
     volumes:
       - "$JF_CONFIG:/config"
 EOF
-  if [ -n "$SHARED_TV" ]; then
+  if [ "$SUB_SERIES" = "1" ]; then
     cat >> "$COMPOSE_FILE" <<EOF
-      - "$(compose_bind "$SHARED_TV"):/media/tv"
+      - "$(compose_bind "$DATA_ROOT/media/series"):/media/series"
 EOF
   fi
-  if [ -n "$SHARED_MOVIES" ]; then
+  if [ "$SUB_MOVIES" = "1" ]; then
     cat >> "$COMPOSE_FILE" <<EOF
-      - "$(compose_bind "$SHARED_MOVIES"):/media/movies"
+      - "$(compose_bind "$DATA_ROOT/media/movies"):/media/movies"
 EOF
   fi
   if [ "$JELLYFIN_ADULT" = "1" ]; then
     cat >> "$COMPOSE_FILE" <<EOF
-      - "$(compose_bind "$SHARED_ADULT"):/media/adult"
+      - "$(compose_bind "$DATA_ROOT/media/adult"):/media/adult"
 EOF
   fi
   cat >> "$COMPOSE_FILE" <<EOF
@@ -1075,6 +1100,7 @@ Useful commands (run inside \`$INSTALL_DIR\`):
 | \`docker compose logs -f <service>\` | Follow logs (e.g. \`zephyrus\`, \`qbittorrent\`) |
 | \`docker compose pull && docker compose up -d\` | Update images |
 | \`docker compose ps\` | Status |
+| \`docker compose down && rm -rf $INSTALL_DIR\` | Remove the whole stack and all its data |
 
 Secrets live in \`.env\` (mode 600) - edit it, then \`docker compose up -d\` to apply.
 
@@ -1099,9 +1125,9 @@ MDHEAD
 1. Open the dashboard, follow the first-run wizard (admin account) if shown.
 2. The installer already wrote a starter \`config.yaml\` at
    \`data/zephyrus/config/config.yaml\` pointing at $ZEPHYRUS_CLIENT_URL
-   (user \`$ZEPHYRUS_CLIENT_USER\`, password from \`.env\` \`QBIT_PASSWORD\`).
-   If the client's password changes later, update \`.env\` and run
-   \`docker compose up -d zephyrus\` to apply it.
+   (user \`$ZEPHYRUS_CLIENT_USER\`, password: the generated WebUI password,
+   read from \`.env\` as \`QBIT_PASSWORD\`). If the client's password changes
+   later, update \`.env\` and run \`docker compose up -d zephyrus\` to apply it.
 3. Assign torrents in qBittorrent to the managed categories
    (\`$ZEPHYRUS_GROUPS\`) - Zephyrus only touches torrents in those groups.
 4. Verify:
@@ -1119,7 +1145,7 @@ MD
 3. Settings -> Services: add an indexer and a torrent client, then test them.
 MD
     if [ "$COMP_QBITTORRENT" = "1" ]; then
-      printf '   qBittorrent is at `http://qbittorrent:8180` (container-to-container).\n'
+      printf '   qBittorrent is at `http://qbittorrent:8180` (username `admin`, password: the generated WebUI password).\n'
     fi
     if [ "$COMP_PROWLARR" = "1" ]; then
       printf '   Prowlarr is at `http://prowlarr:9696` (container-to-container).\n'
@@ -1137,9 +1163,12 @@ MD
 2. You need a **TMDB API key** (themoviedb.org) - configured after boot in
    Settings -> Services, together with at least one indexer and a torrent
    client. Use the built-in test probes before saving.
+3. This stack mounts the TV library at \`/media/series\` and movies at
+   \`/media/movies\` - if Psyche expects its default \`/media/tv\`, point the
+   TV library path at \`/media/series\` in Settings.
 MD
     if [ "$COMP_QBITTORRENT" = "1" ]; then
-      printf '   qBittorrent is at `http://qbittorrent:8180` (container-to-container).\n'
+      printf '   qBittorrent is at `http://qbittorrent:8180` (username `admin`, password: the generated WebUI password).\n'
     fi
     if [ "$COMP_PROWLARR" = "1" ]; then
       printf '   Prowlarr is at `http://prowlarr:9696` (container-to-container).\n'
@@ -1155,9 +1184,9 @@ MD
    paths the installer mounted:
 MD
     if [ -n "$MORPHEUS_MOUNTS" ]; then
-      printf '%s\n' "$MORPHEUS_MOUNTS" | while IFS=$'\t' read -r root slug; do
-        [ -n "$slug" ] || continue
-        printf '   - `/data/%s` (host: %s)\n' "$slug" "$root"
+      printf '%s\n' "$MORPHEUS_MOUNTS" | while IFS=$'\t' read -r root container; do
+        [ -n "$container" ] || continue
+        printf '   - `%s` (host: %s)\n' "$container" "$root"
       done
     else
       printf '   (no archive roots were configured - mount them and re-run the installer)\n'
@@ -1177,14 +1206,19 @@ MD
     cat <<MD
 ### qBittorrent
 
-qBittorrent 5.x has no default WebUI password. On first start it prints a
+Your WebUI credentials: username \`admin\`, password \`$QBIT_PASSWORD\` -
+generated by the installer and stored in \`.env\` as \`QBIT_PASSWORD\`
+(Zephyrus already uses it via the generated config.yaml).
+
+qBittorrent 5.x has no default password. On first start it prints a
 **temporary password** in the container logs:
 
     docker compose logs qbittorrent | grep -i -A2 "temporary password"
 
-Log in with it, set your permanent password, then (if you use Zephyrus) put
-that password into \`.env\` as \`QBIT_PASSWORD\` and run
-\`docker compose up -d zephyrus\`.
+Log in with admin + the temporary password, then immediately change the
+WebUI password (Tools -> Options -> Web UI) to the generated one above.
+Do not change it to anything else, or update \`.env\` (\`QBIT_PASSWORD\`)
+and run \`docker compose up -d\` afterwards so the apps follow.
 
 MD
   fi
@@ -1203,12 +1237,22 @@ MD
 
 Complete the setup wizard, then add libraries from:
 MD
-    [ -n "$SHARED_TV" ] && printf '    - /media/tv (host: %s)\n' "$SHARED_TV"
-    [ -n "$SHARED_MOVIES" ] && printf '    - /media/movies (host: %s)\n' "$SHARED_MOVIES"
-    [ "$JELLYFIN_ADULT" = "1" ] && printf '    - /media/adult (host: %s)\n' "$SHARED_ADULT"
+    [ "$SUB_SERIES" = "1" ] && printf '    - /media/series (host: %s)\n' "$DATA_ROOT/media/series"
+    [ "$SUB_MOVIES" = "1" ] && printf '    - /media/movies (host: %s)\n' "$DATA_ROOT/media/movies"
+    [ "$JELLYFIN_ADULT" = "1" ] && printf '    - /media/adult (host: %s)\n' "$DATA_ROOT/media/adult"
     printf '\n'
   fi
   cat <<MDTAIL
+## Removing the stack
+
+One line removes the whole stack and everything the installer created:
+
+    docker compose down && rm -rf $INSTALL_DIR
+
+All state lives under the install directory (app configs under \`data/\`,
+media and downloads under the data root). Extra archive directories you
+added yourself are never deleted automatically.
+
 ## Backups
 
 Only these hold state worth backing up:
@@ -1222,6 +1266,12 @@ MDTAIL
   [ "$COMP_PROWLARR" = "1" ] && printf '    - data/prowlarr/config\n'
   [ "$COMP_JELLYFIN" = "1" ] && printf '    - data/jellyfin/config\n'
   printf '\nEverything under data/ that is not listed above is regenerable cache.\n'
+  case "$DATA_ROOT" in
+    "$INSTALL_DIR"|"$INSTALL_DIR"/*) : ;;
+    *)
+      printf '\nNote: your data root (%s) is OUTSIDE the install directory -\n' "$DATA_ROOT"
+      printf 'remove it separately when removing the stack.\n' ;;
+  esac
 } > "$STEPS_FILE"
 
 # ---------------------------------------------------------------------------
